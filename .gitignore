@@ -1,0 +1,15 @@
+/work/
+/outputs/
+/build/
+/.zig-cache/
+/bin/
+/pdfium.dll
+/Brisa.exe
+/vendor/pdfium/lib/
+*.pdb
+*.obj
+*.ilk
+*.brisa-ink
+*.brisa-ink.tmp
+*.brisa-test.txt
+*.pdf

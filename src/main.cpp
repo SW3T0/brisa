@@ -17,6 +17,10 @@
 #include "fpdfview.h"
 #include "fpdf_progressive.h"
 #include "fpdf_text.h"
+#include "fpdf_annot.h"
+#include "fpdf_edit.h"
+#include "fpdf_save.h"
+#include <deque>
 #include <vector>
 #include <string>
 #include <memory>
@@ -25,6 +29,7 @@
 
 // PDFium is owned exclusively by the worker. UI never calls its API.
 constexpr UINT READY = WM_APP + 1;
+constexpr UINT EXPORT_READY = WM_APP + 2;
 constexpr double PIXEL_LIMIT = 12000000; // 48 MB per page raster.
 struct Glyph { float l,t,r,b; unsigned code; bool vertical=false; };
 struct Image {
@@ -84,6 +89,10 @@ struct Document {
     bool dirty=false;
     int nextGroup=1,lastTool=1;
 };
+struct ExportJob { Document document; std::wstring destination; };
+struct ExportResult { std::wstring destination,error; };
+std::deque<ExportJob> exportQueue;
+bool exportBusy=false;
 struct Pane {
     int doc=-1,page=0,count=0,panX=0,panY=0;
     double zoom=1; bool fit=true,busy=false;
@@ -113,6 +122,7 @@ Request pending;
 volatile LONG generation=0,stopping=0;
 constexpr unsigned POINT_LIMIT=200000,HIGHLIGHT_LIMIT=100000,WORKSPACE_MENU=1000;
 enum { OPEN=100,EXIT,FIT,PLUS,MINUS,FULL,HAND,MARKER,PEN,UNDO,SAVE,SIDEBAR,SPLIT };
+constexpr unsigned EXPORT_PDF=113;
 int px(int v) { return (int)round(v*dpiScale); }
 Workspace* workspace() { return activeWorkspace>=0?workspaces[activeWorkspace].get():nullptr; }
 Pane* focusedPane() { auto* w=workspace(); return w?&w->panes[w->active]:nullptr; }
@@ -254,11 +264,132 @@ Image* render(Engine& e,const Item& r,LONG g,bool cancellable=true) {
     FPDF_ClosePage(p); return out.release();
 }
 void dispose(Result* result) { if(result) { delete result->images[0]; delete result->images[1]; delete result; } }
+// Export opens its own document on the same worker thread. Rendering caches and
+// the original file stay untouched, even if export is cancelled or fails.
+bool sameFile(const std::wstring& first,const std::wstring& second) {
+    if(!_wcsicmp(first.c_str(),second.c_str())) return true;
+    HANDLE a=CreateFileW(first.c_str(),0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
+    HANDLE b=CreateFileW(second.c_str(),0,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
+    BY_HANDLE_FILE_INFORMATION x{},y{};
+    bool same=a!=INVALID_HANDLE_VALUE&&b!=INVALID_HANDLE_VALUE&&GetFileInformationByHandle(a,&x)&&GetFileInformationByHandle(b,&y)&&
+        x.dwVolumeSerialNumber==y.dwVolumeSerialNumber&&x.nFileIndexHigh==y.nFileIndexHigh&&x.nFileIndexLow==y.nFileIndexLow;
+    if(a!=INVALID_HANDLE_VALUE) CloseHandle(a); if(b!=INVALID_HANDLE_VALUE) CloseHandle(b); return same;
+}
+FS_POINTF pdfPoint(FPDF_PAGE page,float x,float y) {
+    double a=0,b=0;
+    FPDF_DeviceToPage(page,0,0,1000000,1000000,0,(int)round(x*1000000),(int)round(y*1000000),&a,&b);
+    return {(float)a,(float)b};
+}
+FS_RECTF bounds(const std::vector<FS_POINTF>& points,float padding=0) {
+    FS_RECTF r{points[0].x,points[0].y,points[0].x,points[0].y};
+    for(auto p:points) { r.left=std::min(r.left,p.x); r.right=std::max(r.right,p.x); r.top=std::max(r.top,p.y); r.bottom=std::min(r.bottom,p.y); }
+    r.left-=padding; r.right+=padding; r.top+=padding; r.bottom-=padding; return r;
+}
+bool embedMarks(FPDF_DOCUMENT pdf,const Document& d) {
+    int pages=FPDF_GetPageCount(pdf);
+    // Visit only marked pages, rather than loading a large document in full.
+    std::vector<int> marked;
+    for(auto h:d.highlights) marked.push_back(h.page);
+    for(auto p:d.ink) if(p.start) marked.push_back(p.page);
+    std::sort(marked.begin(),marked.end()); marked.erase(std::unique(marked.begin(),marked.end()),marked.end());
+    for(int number:marked) {
+        if(number<0||number>=pages) return false;
+        FPDF_PAGE page=FPDF_LoadPage(pdf,number); if(!page) return false;
+        bool ok=true;
+        for(size_t i=0;i<d.highlights.size()&&ok;) {
+            const auto& h=d.highlights[i]; if(h.page!=number) {i++;continue;}
+            int group=h.group; FPDF_ANNOTATION annot=FPDFPage_CreateAnnot(page,FPDF_ANNOT_HIGHLIGHT);
+            if(!annot) {ok=false;break;}
+            std::vector<FS_POINTF> corners;
+            ok=FPDFAnnot_SetColor(annot,FPDFANNOT_COLORTYPE_Color,250,201,38,90)&&FPDFAnnot_SetFlags(annot,FPDF_ANNOT_FLAG_PRINT);
+            do {
+                const auto& r=d.highlights[i];
+                auto a=pdfPoint(page,r.l,r.t),b=pdfPoint(page,r.r,r.t),c=pdfPoint(page,r.l,r.b),e=pdfPoint(page,r.r,r.b);
+                FS_QUADPOINTSF quad{a.x,a.y,b.x,b.y,c.x,c.y,e.x,e.y};
+                ok=ok&&FPDFAnnot_AppendAttachmentPoints(annot,&quad);
+                corners.insert(corners.end(),{a,b,c,e}); i++;
+            } while(i<d.highlights.size()&&d.highlights[i].page==number&&d.highlights[i].group==group);
+            auto rect=bounds(corners); ok=ok&&FPDFAnnot_SetRect(annot,&rect); FPDFPage_CloseAnnot(annot);
+        }
+        for(size_t i=0;i<d.ink.size()&&ok;) {
+            const auto& p=d.ink[i]; size_t end=i+1; while(end<d.ink.size()&&!d.ink[end].start&&d.ink[end].page==p.page) end++;
+            if(p.page!=number) {i=end;continue;}
+            std::vector<FS_POINTF> points; points.reserve(end-i+1);
+            for(size_t j=i;j<end;j++) points.push_back(pdfPoint(page,d.ink[j].x,d.ink[j].y));
+            if(points.size()==1) points.push_back({points[0].x+.01f,points[0].y});
+            float width=p.tool==1?12.f:1.6f; unsigned alpha=p.tool==1?68:230;
+            unsigned red=p.tool==1?247:48,green=p.tool==1?201:74,blue=p.tool==1?49:61;
+            FPDF_ANNOTATION annot=FPDFPage_CreateAnnot(page,FPDF_ANNOT_INK);
+            if(!annot) {ok=false;break;}
+            auto rect=bounds(points,width);
+            ok=FPDFAnnot_SetRect(annot,&rect)&&FPDFAnnot_SetBorder(annot,0,0,width)&&
+                FPDFAnnot_SetColor(annot,FPDFANNOT_COLORTYPE_Color,red,green,blue,alpha)&&FPDFAnnot_SetFlags(annot,FPDF_ANNOT_FLAG_PRINT)&&
+                FPDFAnnot_AddInkStroke(annot,points.data(),points.size())>=0;
+            // Explicit appearance path also renders in readers that do not
+            // synthesize an InkList appearance on opening the file.
+            FPDF_PAGEOBJECT path=FPDFPageObj_CreateNewPath(points[0].x,points[0].y);
+            if(!path) ok=false;
+            else {
+                bool appearance=FPDFPageObj_SetStrokeColor(path,red,green,blue,alpha)&&FPDFPageObj_SetStrokeWidth(path,width)&&FPDFPath_SetDrawMode(path,FPDF_FILLMODE_NONE,1);
+                for(size_t j=1;j<points.size();j++) appearance=appearance&&FPDFPath_LineTo(path,points[j].x,points[j].y);
+                if(!ok||!appearance||!FPDFAnnot_AppendObject(annot,path)) {FPDFPageObj_Destroy(path);ok=false;}
+            }
+            FPDFPage_CloseAnnot(annot); i=end;
+        }
+        if(ok) {
+            // PDFium's annotation render pass promotes new dictionaries to
+            // indirect objects and generates missing appearances. A 1px
+            // target prepares interoperable annotations without a page image.
+            FPDF_BITMAP bitmap=FPDFBitmap_Create(1,1,0);
+            if(!bitmap) ok=false;
+            else { FPDF_RenderPageBitmap(bitmap,page,0,0,1,1,0,FPDF_ANNOT); FPDFBitmap_Destroy(bitmap); }
+        }
+        FPDF_ClosePage(page); if(!ok) return false;
+    }
+    return true;
+}
+struct PdfWriter {
+    FPDF_FILEWRITE api{1,write}; HANDLE file=INVALID_HANDLE_VALUE;
+    static int write(FPDF_FILEWRITE* self,const void* data,unsigned long size) {
+        auto* writer=reinterpret_cast<PdfWriter*>(self); DWORD done=0;
+        return WriteFile(writer->file,data,size,&done,nullptr)&&done==size;
+    }
+};
+ExportResult* exportPdf(const ExportJob& job) {
+    auto result=std::make_unique<ExportResult>(); result->destination=job.destination;
+    if(sameFile(job.document.path,job.destination)) {result->error=L"Elige otro archivo para conservar el PDF original.";return result.release();}
+    Engine engine; wchar_t error[160]{};
+    if(!engine.open(job.document.path.c_str(),error)) {result->error=error;return result.release();}
+    if(!embedMarks(engine.doc,job.document)) {result->error=L"No se pudieron incorporar las anotaciones al PDF.";engine.close();return result.release();}
+    // Create a unique temporary file in the destination directory, then rename
+    // it atomically: a failed export never truncates an existing destination.
+    std::wstring temporary; HANDLE file=INVALID_HANDLE_VALUE;
+    for(int n=0;n<20&&file==INVALID_HANDLE_VALUE;n++) {
+        temporary=job.destination+L".brisa-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64())+L"-"+std::to_wstring(n)+L".tmp";
+        file=CreateFileW(temporary.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    }
+    if(file==INVALID_HANDLE_VALUE) result->error=L"No se puede escribir en la carpeta de destino.";
+    else {
+        PdfWriter writer; writer.file=file;
+        bool ok=FPDF_SaveAsCopy(engine.doc,&writer.api,FPDF_NO_INCREMENTAL)&&FlushFileBuffers(file);
+        CloseHandle(file); engine.close();
+        if(ok) ok=MoveFileExW(temporary.c_str(),job.destination.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+        if(!ok) {DeleteFileW(temporary.c_str());result->error=L"No se pudo guardar el PDF. Comprueba los permisos o si está abierto en otro programa.";}
+    }
+    engine.close(); return result.release();
+}
 DWORD WINAPI workerMain(void*) {
     FPDF_InitLibrary(); Engine engines[2];
     while(true) {
         WaitForSingleObject(wakeEvent,INFINITE); if(InterlockedCompareExchange(&stopping,0,0)) break;
-        EnterCriticalSection(&mutex); Request r=pending; LeaveCriticalSection(&mutex);
+        EnterCriticalSection(&mutex); Request r=pending;
+        std::unique_ptr<ExportJob> job;
+        if(!exportQueue.empty()) {job=std::make_unique<ExportJob>(std::move(exportQueue.front()));exportQueue.pop_front();}
+        LeaveCriticalSection(&mutex);
+        if(job) {
+            auto* outcome=exportPdf(*job);
+            if(!PostMessageW(window,EXPORT_READY,0,(LPARAM)outcome)) delete outcome;
+        }
         auto result=new Result{}; result->generation=r.generation;
         for(int n=0;n<r.panes&&!stale(r.generation);n++) if(r.items[n].render) result->images[n]=render(engines[n],r.items[n],r.generation);
         if(r.panes<1) engines[0].close();
@@ -331,6 +462,29 @@ void openDialog() {
     if(!GetOpenFileNameW(&ofn)) return;
     const wchar_t* name=paths+wcslen(paths)+1;
     if(!*name) openPath(paths); else for(;*name;name+=wcslen(name)+1) { std::wstring full=std::wstring(paths)+L"\\"+name; openPath(full.c_str()); }
+}
+void beginExport(const std::wstring& destination) {
+    if(exportBusy) { notify(L"Espera a que termine el guardado del PDF."); return; }
+    finishInteraction(); auto* pane=focusedPane(); if(!pane) return;
+    for(auto& document:documents) if(sameFile(document.path,destination)) {
+        notify(L"Elige una copia nueva para conservar el PDF original."); return;
+    }
+    ExportJob job{documents[pane->doc],destination};
+    EnterCriticalSection(&mutex); exportQueue.push_back(std::move(job)); LeaveCriticalSection(&mutex);
+    exportBusy=true; SetEvent(wakeEvent); notify(L"Guardando PDF anotado…");
+}
+void exportDialog() {
+    auto* pane=focusedPane(); if(!pane) return;
+    if(exportBusy) { notify(L"Espera a que termine el guardado del PDF."); return; }
+    std::wstring name=documents[pane->doc].path;
+    auto dot=name.find_last_of(L'.'); if(dot!=std::wstring::npos) name.resize(dot);
+    name+=L"-anotado.pdf";
+    wchar_t path[32768]{}; wcsncpy(path,name.c_str(),32767);
+    OPENFILENAMEW ofn{sizeof(ofn)}; ofn.hwndOwner=window;
+    ofn.lpstrFilter=L"Documento PDF\0*.pdf\0"; ofn.lpstrDefExt=L"pdf";
+    ofn.lpstrFile=path; ofn.nMaxFile=32768;
+    ofn.Flags=OFN_OVERWRITEPROMPT|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
+    if(GetSaveFileNameW(&ofn)) beginExport(path);
 }
 void createPair(int other) {
     auto* current=workspace(); if(!current||other<0||other>=(int)documents.size()) return;
@@ -541,7 +695,7 @@ void paint(HDC supplied=nullptr) {
     if(sidebarVisible) {
         RECT side{0,px(44),px(58),rc.bottom}; fill(dc,side,RGB(248,250,244));
         RECT edge{px(57),px(44),px(58),rc.bottom}; fill(dc,edge,RGB(226,231,219));
-        const wchar_t* names[]={L"Leer",L"Texto",L"Lápiz",L"Deshacer",L"Doble"}; int kinds[]={9,1,2,8,0};
+        const wchar_t* names[]={L"Leer",L"Subrayar",L"Lápiz",L"Deshacer",L"Doble"}; int kinds[]={9,1,2,8,0};
         for(int n=0;n<5;n++) {
             int y=px(57+n*58); RECT box{px(9),y,px(49),y+px(34)};
             if(n<3&&tool==n) rounded(dc,box,RGB(227,236,218)); icon(dc,kinds[n],box,RGB(81,101,73));
@@ -578,6 +732,8 @@ void toggleFullscreen() {
 LRESULT CALLBACK windowProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     switch(msg) {
 #ifdef BRISA_TEST
+        case WM_APP+12: if(focusedPane()) beginExport(documents[focusedPane()->doc].path+L".exported.pdf"); return 0;
+        case WM_APP+13: return exportBusy;
         case WM_APP+7: {
             HDC dc=GetDC(hwnd); paint(dc); BITMAPINFO info{}; info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
             info.bmiHeader.biWidth=canvasWidth; info.bmiHeader.biHeight=-canvasHeight; info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32;
@@ -609,7 +765,7 @@ LRESULT CALLBACK windowProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: paint(); return 0;
         case WM_PRINTCLIENT: paint((HDC)wp); return 0;
-        case WM_CLOSE: finishInteraction(); if(saveAll(true)) DestroyWindow(hwnd); return 0;
+        case WM_CLOSE: if(exportBusy) { notify(L"Espera a que termine el guardado del PDF."); return 0; } finishInteraction(); if(saveAll(true)) DestroyWindow(hwnd); return 0;
         case WM_KILLFOCUS: finishInteraction(false); return 0;
         case WM_GETMINMAXINFO: ((MINMAXINFO*)lp)->ptMinTrackSize={px(760),px(500)}; return 0;
         case WM_DPICHANGED: {
@@ -625,6 +781,10 @@ LRESULT CALLBACK windowProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
             for(int n=0;n<w.count;n++) if(result->images[n]) { auto& p=w.panes[n]; p.image.reset(result->images[n]); result->images[n]=nullptr; p.page=p.image->page; p.count=p.image->count; p.busy=false; }
             dispose(result); updateTitle(); repaint(); return 0;
         }
+        case EXPORT_READY: {
+            std::unique_ptr<ExportResult> result((ExportResult*)lp); exportBusy=false;
+            notify(result->error.empty()?L"PDF anotado guardado.":result->error.c_str()); return 0;
+        }
         case WM_DROPFILES: {
             finishInteraction(); UINT count=DragQueryFileW((HDROP)wp,0xffffffff,nullptr,0);
             for(UINT n=0;n<count;n++) { wchar_t path[32768]; if(DragQueryFileW((HDROP)wp,n,path,32768)) openPath(path); }
@@ -635,7 +795,7 @@ LRESULT CALLBACK windowProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
             if(LOWORD(wp)>=WORKSPACE_MENU&&LOWORD(wp)<WORKSPACE_MENU+128) { switchWorkspace(LOWORD(wp)-WORKSPACE_MENU); return 0; }
             if(LOWORD(wp)>=3000&&LOWORD(wp)<3064) { createPair(LOWORD(wp)-3000); return 0; }
             switch(LOWORD(wp)) {
-                case OPEN: openDialog(); break; case EXIT: SendMessageW(hwnd,WM_CLOSE,0,0); break;
+                case OPEN: openDialog(); break; case EXPORT_PDF: exportDialog(); break; case EXIT: SendMessageW(hwnd,WM_CLOSE,0,0); break;
                 case FIT: fitPage(); break; case PLUS: zoomBy(1.2); break; case MINUS: zoomBy(1/1.2); break;
                 case FULL: toggleFullscreen(); break; case HAND: setTool(0); break; case MARKER: setTool(1); break; case PEN: setTool(2); break;
                 case UNDO: undo(); break; case SAVE: saveAll(); break; case SIDEBAR: toggleSidebar(); break; case SPLIT: pairMenu(); break;
@@ -697,7 +857,7 @@ LRESULT CALLBACK windowProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
             Pane* p=focusedPane();
             if(ctrl&&wp>='1'&&wp<='9') switchWorkspace((int)wp-'1');
             else if(ctrl&&wp==VK_TAB&&!workspaces.empty()) switchWorkspace((activeWorkspace+(int)workspaces.size()+(shift?-1:1))%(int)workspaces.size());
-            else if(ctrl&&wp=='O') openDialog(); else if(ctrl&&wp=='S') saveAll(); else if(ctrl&&wp=='Z') undo();
+            else if(ctrl&&wp=='O') openDialog(); else if(ctrl&&shift&&wp=='S') exportDialog(); else if(ctrl&&wp=='S') { finishInteraction(); saveAll(); } else if(ctrl&&wp=='Z') undo();
             else if(ctrl&&wp=='W') closeWorkspace(activeWorkspace); else if(ctrl&&wp=='B') toggleSidebar(); else if(ctrl&&wp=='D') pairMenu();
             else if(wp=='H') setTool(1); else if(wp=='P') setTool(2); else if(wp=='V') setTool(0);
             else if(wp==VK_F10) { menuVisible=!menuVisible; SetMenu(hwnd,menuVisible?menus:nullptr); DrawMenuBar(hwnd); }
@@ -727,6 +887,13 @@ int selfTest(const wchar_t* path) {
 }
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     int argc=0; wchar_t** argv=CommandLineToArgvW(GetCommandLineW(),&argc);
+#ifdef BRISA_TEST
+    if(argc==4&&!wcscmp(argv[1],L"--export-test")) {
+        FPDF_InitLibrary(); Document document; document.path=argv[2]; loadDocument(document);
+        std::unique_ptr<ExportResult> result(exportPdf({document,argv[3]}));
+        int code=result->error.empty()?0:1; FPDF_DestroyLibrary(); LocalFree(argv); return code;
+    }
+#endif
     if(argc>=3&&!wcscmp(argv[1],L"--self-test")) { int code=selfTest(argv[2]); LocalFree(argv); return code; }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     Gdiplus::GdiplusStartupInput startup; Gdiplus::GdiplusStartup(&gdiplusToken,&startup,nullptr);
@@ -736,7 +903,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     penCursor=CreateCursor(instance,16,16,32,32,andMask,xorMask);
     WNDCLASSW cls{}; cls.lpfnWndProc=windowProc; cls.hInstance=instance; cls.lpszClassName=L"BrisaPdfWindow"; cls.hCursor=LoadCursorW(nullptr,IDC_ARROW); cls.hIcon=LoadIconW(nullptr,IDI_APPLICATION); RegisterClassW(&cls);
     menus=CreateMenu(); HMENU file=CreatePopupMenu(),view=CreatePopupMenu(),mark=CreatePopupMenu(); workspaceMenu=CreatePopupMenu();
-    AppendMenuW(file,MF_STRING,OPEN,L"Abrir PDFs…\tCtrl+O"); AppendMenuW(file,MF_STRING,SAVE,L"Guardar marcas\tCtrl+S"); AppendMenuW(file,MF_STRING,EXIT,L"Salir");
+    AppendMenuW(file,MF_STRING,OPEN,L"Abrir PDFs…\tCtrl+O"); AppendMenuW(file,MF_STRING,SAVE,L"Guardar marcas\tCtrl+S"); AppendMenuW(file,MF_STRING,EXPORT_PDF,L"Guardar PDF anotado…\tCtrl+Shift+S"); AppendMenuW(file,MF_STRING,EXIT,L"Salir");
     AppendMenuW(view,MF_STRING,FIT,L"Ajustar página\t0"); AppendMenuW(view,MF_STRING,PLUS,L"Acercar\t+"); AppendMenuW(view,MF_STRING,MINUS,L"Alejar\t−");
     AppendMenuW(view,MF_STRING,SIDEBAR,L"Herramientas\tCtrl+B"); AppendMenuW(view,MF_STRING,SPLIT,L"Dos PDFs lado a lado\tCtrl+D"); AppendMenuW(view,MF_STRING,FULL,L"Pantalla completa\tF11");
     AppendMenuW(mark,MF_STRING|MF_CHECKED,HAND,L"Leer / mover\tV"); AppendMenuW(mark,MF_STRING,MARKER,L"Subrayar texto\tH"); AppendMenuW(mark,MF_STRING,PEN,L"Lápiz\tP"); AppendMenuW(mark,MF_STRING,UNDO,L"Deshacer\tCtrl+Z");
@@ -748,6 +915,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
     MSG msg; while(GetMessageW(&msg,nullptr,0,0)>0) {TranslateMessage(&msg);DispatchMessageW(&msg);}
     InterlockedExchange(&stopping,1); SetEvent(wakeEvent); WaitForSingleObject(worker,INFINITE);
     while(PeekMessageW(&msg,nullptr,READY,READY,PM_REMOVE)) dispose((Result*)msg.lParam);
+    while(PeekMessageW(&msg,nullptr,EXPORT_READY,EXPORT_READY,PM_REMOVE)) delete (ExportResult*)msg.lParam;
     CloseHandle(worker);CloseHandle(wakeEvent);DeleteCriticalSection(&mutex);
     if(canvas) {SelectObject(canvas,originalBitmap);DeleteObject(canvasBitmap);DeleteDC(canvas);}
     DeleteObject(uiFont);DeleteObject(smallFont);DeleteObject(headingFont);DestroyCursor(penCursor);DestroyMenu(menus); Gdiplus::GdiplusShutdown(gdiplusToken); return 0;

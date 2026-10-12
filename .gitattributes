@@ -3,4 +3,6 @@
 *.h text eol=lf
 *.md text eol=lf
 *.ps1 text eol=lf
+*.psd1 text eol=lf
+*.py text eol=lf
 *.png binary

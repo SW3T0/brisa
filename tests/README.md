@@ -6,3 +6,14 @@ These checks use a Windows `BRISA_TEST` build; test hooks are excluded from rele
 4. Install the test-only dependency with `python -m pip install pymupdf`, then run `python tests/export_test.py work/Brisa-03-test.exe work/export-tests`.
 
 Export checks use MuPDF as an independent renderer, cover all page rotations, retain existing annotations and verify that originals and existing destinations survive failed saves.
+
+Formatting tools are optional development tools, not application dependencies:
+
+```powershell
+clang-format -i src/main.cpp
+python -m black tests/create_fixtures.py tests/export_test.py
+Import-Module PSScriptAnalyzer
+Invoke-Formatter -ScriptDefinition (Get-Content tests/workspace-test.ps1 -Raw) -Settings .PSScriptAnalyzerSettings.psd1
+```
+
+The last command returns formatted text; it does not overwrite the script. Preserve UTF-8 with BOM when saving PowerShell files containing Spanish text.

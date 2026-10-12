@@ -86,6 +86,18 @@ unsigned inkCount = 0, inkCapacity = 0;
 constexpr unsigned INK_LIMIT = 200000;
 struct InkHeader { char magic[8]; unsigned count; DWORD sizeLow,sizeHigh; FILETIME modified; };
 enum { OPEN=100, EXIT, FIT, PLUS, MINUS, FULL, HAND, MARKER, PEN, UNDO, SAVE };
+constexpr unsigned DOCUMENT_MENU = 1000;
+constexpr int MAX_DOCUMENTS = 64;
+struct Document {
+    wchar_t* path;
+    int page, count, panX, panY, tool;
+    double zoom;
+    bool fit;
+};
+Document documents[MAX_DOCUMENTS]{};
+int documentCount = 0, activeDocument = -1;
+HMENU documentsMenu;
+
 bool saveInk() {
     if(!currentPath[0] || !inkDirty) return true;
     wchar_t path[32768], temp[32768];
@@ -155,7 +167,8 @@ void toggleMenus() { menusVisible=!menusVisible; SetMenu(window,menusVisible?men
 void updateTitle() {
     wchar_t title[600]; const wchar_t* name=wcsrchr(currentPath,L'\\'); name=name?name+1:currentPath;
     const wchar_t* tool=inkTool==1?L" · Subrayador":inkTool==2?L" · Lápiz":L"";
-    if(pageCount) swprintf(title,600,L"Brisa — %.450ls · %d/%d%ls",name,pageIndex+1,pageCount,tool);
+    if(documentCount>1) swprintf(title,600,L"Brisa — %.400ls · PDF %d/%d · %d/%d%ls",name,activeDocument+1,documentCount,pageIndex+1,pageCount,tool);
+    else if(pageCount) swprintf(title,600,L"Brisa — %.450ls · %d/%d%ls",name,pageIndex+1,pageCount,tool);
     else swprintf(title,600,L"Brisa — %.450ls%ls",name,tool);
     SetWindowTextW(window,title);
 }
@@ -224,16 +237,61 @@ void requestRender() {
     EnterCriticalSection(&mutex); pending = r; LeaveCriticalSection(&mutex);
     busy = true; SetEvent(wakeEvent); InvalidateRect(window, nullptr, FALSE);
 }
+void refreshDocumentsMenu() {
+    while(GetMenuItemCount(documentsMenu)>0) DeleteMenu(documentsMenu,0,MF_BYPOSITION);
+    for(int n=0;n<documentCount;n++) {
+        const wchar_t* name=wcsrchr(documents[n].path,L'\\'); name=name?name+1:documents[n].path;
+        wchar_t label[600];
+        // Escape ampersands so PDF filenames remain literal menu labels.
+        wchar_t escaped[500]; int at=0;
+        for(int j=0;name[j] && at<496;j++) { escaped[at++]=name[j]; if(name[j]==L'&') escaped[at++]=L'&'; }
+        escaped[at]=0;
+        if(n<9) swprintf(label,600,L"%d. %ls\tCtrl+%d",n+1,escaped,n+1);
+        else swprintf(label,600,L"%d. %ls",n+1,escaped);
+        AppendMenuW(documentsMenu,MF_STRING|(n==activeDocument?MF_CHECKED:0),DOCUMENT_MENU+n,label);
+    }
+}
+bool switchDocument(int slot) {
+    if(slot<0 || slot>=documentCount || slot==activeDocument) return false;
+    drawingInk=false; dragging=false; ReleaseCapture();
+    if(!protectInk()) return false;
+    if(activeDocument>=0) {
+        Document& previous=documents[activeDocument];
+        previous.page=pageIndex; previous.count=pageCount;
+        previous.panX=panX; previous.panY=panY; previous.zoom=zoom; previous.fit=fit; previous.tool=inkTool;
+    }
+    activeDocument=slot; Document& next=documents[slot];
+    wcscpy(currentPath,next.path); pageIndex=next.page; pageCount=next.count;
+    panX=next.panX; panY=next.panY; zoom=next.zoom; fit=next.fit; inkTool=next.tool;
+    loadInk();
+    dispose(displayed); displayed = nullptr;
+    CheckMenuRadioItem(GetSubMenu(menus,2),HAND,PEN,HAND+inkTool,MF_BYCOMMAND);
+    refreshDocumentsMenu();
+    updateTitle();
+    requestRender();
+    return true;
+}
 void openPath(const wchar_t* p) {
-    if (wcslen(p) >= 32768 || !protectInk()) return;
-    wcscpy(currentPath, p); pageIndex = pageCount = 0; panX = panY = 0; fit = true;
-    loadInk(); dispose(displayed); displayed = nullptr; updateTitle(); requestRender();
+    wchar_t absolute[32768]; DWORD len=GetFullPathNameW(p,32768,absolute,nullptr);
+    if(!len || len>=32768) return;
+    for(int n=0;n<documentCount;n++) if(!_wcsicmp(documents[n].path,absolute)) { switchDocument(n); return; }
+    if(documentCount==MAX_DOCUMENTS) { MessageBoxW(window,L"Puedes abrir hasta 64 PDFs en esta sesión.",L"Brisa",MB_OK); return; }
+    wchar_t* path=_wcsdup(absolute); if(!path) return;
+    documents[documentCount]={path,0,0,0,0,0,1.0,true}; documentCount++;
+    if(!switchDocument(documentCount-1)) { free(path); documents[--documentCount]={}; }
 }
 void openDialog() {
     wchar_t path[32768]{}; OPENFILENAMEW ofn{sizeof(ofn)};
-    ofn.hwndOwner=window; ofn.lpstrFilter=L"Documentos PDF\0*.pdf\0Todos los archivos\0*.*\0";
-    ofn.lpstrFile=path; ofn.nMaxFile=32768; ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
-    if(GetOpenFileNameW(&ofn)) openPath(path);
+    ofn.hwndOwner = window; ofn.lpstrFilter = L"Documentos PDF\0*.pdf\0Todos los archivos\0*.*\0";
+    ofn.lpstrFile = path; ofn.nMaxFile = 32768; ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+    if (GetOpenFileNameW(&ofn)) {
+        const wchar_t* name=path+wcslen(path)+1;
+        if(!*name) openPath(path);
+        else for(;*name;name+=wcslen(name)+1) {
+            wchar_t full[32768]; if(wcslen(path)+wcslen(name)+2>=32768) continue;
+            swprintf(full,32768,L"%ls\\%ls",path,name); openPath(full);
+        }
+    }
 }
 void go(int next) {
     if (pageCount < 1) return;
@@ -357,6 +415,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CLOSE: if(protectInk()) DestroyWindow(hwnd); return 0;
         case WM_SYSCOMMAND: if((wp&0xfff0)==SC_KEYMENU && lp==0) { toggleMenus(); return 0; } break;
         case WM_COMMAND:
+            if(LOWORD(wp)>=DOCUMENT_MENU && LOWORD(wp)<DOCUMENT_MENU+MAX_DOCUMENTS) { switchDocument(LOWORD(wp)-DOCUMENT_MENU); return 0; }
             switch(LOWORD(wp)) {
                 case OPEN: openDialog(); break; case EXIT: SendMessageW(hwnd,WM_CLOSE,0,0); break;
                 case FIT: fit=true; panX=panY=0; requestRender(); break;
@@ -385,7 +444,9 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd,nullptr,FALSE); return 0;
         }
         case WM_DROPFILES: {
-            wchar_t p[32768]; if(DragQueryFileW((HDROP)wp,0,p,32768)) openPath(p); DragFinish((HDROP)wp); return 0;
+            UINT count=DragQueryFileW((HDROP)wp,0xffffffff,nullptr,0);
+            for(UINT n=0;n<count;n++) { wchar_t p[32768]; if(DragQueryFileW((HDROP)wp,n,p,32768)) openPath(p); }
+            DragFinish((HDROP)wp); return 0;
         }
         case WM_LBUTTONDOWN: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
@@ -411,7 +472,9 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_KEYDOWN:
-            if ((GetKeyState(VK_CONTROL)&0x8000) && wp=='O') openDialog();
+            if ((GetKeyState(VK_CONTROL)&0x8000) && wp>='1' && wp<='9') switchDocument((int)wp-'1');
+            else if ((GetKeyState(VK_CONTROL)&0x8000) && wp==VK_TAB && documentCount>1) switchDocument((activeDocument+documentCount+((GetKeyState(VK_SHIFT)&0x8000)?-1:1))%documentCount);
+            else if ((GetKeyState(VK_CONTROL)&0x8000) && wp=='O') openDialog();
             else if ((GetKeyState(VK_CONTROL)&0x8000) && wp=='S') SendMessageW(hwnd,WM_COMMAND,SAVE,0);
             else if ((GetKeyState(VK_CONTROL)&0x8000) && wp=='Z') undoInk();
             else if(wp=='H') setTool(1); else if(wp=='P') setTool(2); else if(wp=='V') setTool(0);
@@ -470,12 +533,13 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE, PWSTR,int show) {
     AppendMenuW(markMenu,MF_STRING,UNDO,L"Deshacer trazo\tCtrl+Z");
     AppendMenuW(menus,MF_POPUP,(UINT_PTR)fileMenu,L"Archivo"); AppendMenuW(menus,MF_POPUP,(UINT_PTR)viewMenu,L"Vista");
     AppendMenuW(menus,MF_POPUP,(UINT_PTR)markMenu,L"Marcar");
+    documentsMenu=CreatePopupMenu(); AppendMenuW(menus,MF_POPUP,(UINT_PTR)documentsMenu,L"PDFs");
     window=CreateWindowExW(WS_EX_ACCEPTFILES,cls.lpszClassName,L"Brisa",WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,CW_USEDEFAULT,px(1050),px(820),nullptr,nullptr,instance,nullptr);
     if(!window || !wakeEvent) return 1;
     worker=CreateThread(nullptr,0,workerMain,nullptr,0,nullptr);
     if(!worker) return 1;
-    if(argc>1) openPath(argv[1]); LocalFree(argv);
+    for(int n=1;n<argc;n++) openPath(argv[n]); LocalFree(argv);
     ShowWindow(window,show); UpdateWindow(window);
     MSG msg; while(GetMessageW(&msg,nullptr,0,0)>0) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     InterlockedExchange(&stopping,1); SetEvent(wakeEvent); WaitForSingleObject(worker,INFINITE);
@@ -484,6 +548,6 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE, PWSTR,int show) {
     dispose(displayed); CloseHandle(worker); CloseHandle(wakeEvent); DeleteCriticalSection(&mutex);
     DeleteObject(uiFont); DeleteObject(headingFont);
     if(canvas) { SelectObject(canvas,originalBitmap); DeleteObject(canvasBitmap); DeleteDC(canvas); }
-    DestroyMenu(menus); free(ink);
+    DestroyMenu(menus); free(ink); for(int n=0;n<documentCount;n++) free(documents[n].path);
     Gdiplus::GdiplusShutdown(gdiplusToken); return 0;
 }

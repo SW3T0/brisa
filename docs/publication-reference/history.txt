@@ -1,0 +1,5 @@
+a45925b (HEAD -> main, origin/main) Refresh README screenshot with calculus study example
+0ba3fdc (tag: v0.3.1) Release Brisa 0.3.1 with embedded PDF annotation export
+2cc2e33 (tag: v0.3) Import recovered Brisa 0.3 source snapshot
+3980f97 (tag: v0.1) Reconstruct Brisa 0.1 single-document version
+e317347 (tag: v0.2) Import recovered Brisa 0.2 source snapshot
